@@ -8,6 +8,8 @@
 #include <iterator>
 #endif
 
+#include <type_traits>
+
 template<typename T>
 class paged_vector {
 	using value_type = T;
@@ -18,35 +20,42 @@ class paged_vector {
 	static constexpr int bits = 6;
 	static constexpr int page_size = 1 << bits;
 	static constexpr size_t mask = (page_size - 1);
+	//using page = void*;
 	struct page {
-		T elements[page_size];
+		std::aligned_storage_t <sizeof(T), alignof(T)> elements[page_size];
 	};
 public:
 
 	paged_vector() noexcept = default;
 	paged_vector(const paged_vector& other) noexcept
 	{
+		//make sure to destroy everything
+		clear();
 		resize(other.last_index);
 
 		for (int i = 0; i < other.last_index; i++) {
-			(*this)[i] = other[i];
+			operator[](i) = other[i];
 		}
 	}
 	paged_vector& operator=(const paged_vector&other)
 	{
+		//make sure to destroy everything
+		clear();
 		resize(other.last_index);
 
 		for (int i = 0; i < other.last_index; i++) {
-			(*this)[i] = other[i];
+			operator[](i) = other[i];
 		}
 
 		return *this;
 	};
 
 	~paged_vector() noexcept {
-		clear();
+		resize(0);
 	}
 	paged_vector(paged_vector&& other) noexcept{
+		resize(0);
+
 		last_index = other.last_index;
 		page_array = other.page_array;		
 	    page_capacity = other.page_capacity;
@@ -56,7 +65,7 @@ public:
 		other.page_capacity = 0;
 	}
 	paged_vector& operator=(paged_vector&& other) {
-		clear();
+		resize(0);
 
 		last_index = other.last_index;
 		page_array = other.page_array;
@@ -128,7 +137,7 @@ public:
 		}
 
 		reference operator*() { return (*_owner)[_idx]; }
-		pointer operator->() { return &((*_owner)[_idx]); }
+		pointer operator->() { return _owner.at_index(_idx); }
 		bool operator==(const iterator& rhs) const { return _idx == rhs._idx && _owner == rhs._owner; }
 		bool operator!=(const iterator& rhs) const { return !(*this == rhs); }
 		bool operator<(const iterator& rhs) const { return _idx < rhs._idx; }
@@ -150,16 +159,17 @@ public:
 	}
 
 	reference operator[](size_type index) {
-		return page_array[index >> bits]->elements[index & mask];
+		pointer p = at_index(index);
+		return *p;//reinterpret_cast<reference>(*p);
 	}
 	const_reference operator[](size_type index) const {
-		return page_array[index >> bits]->elements[index & mask];
+		pointer p = at_index(index);
+		return *p; //reinterpret_cast<const_reference>(*p);
 	}
-	size_type size() {
+	size_type size() const{
 		return last_index;
 	}
-	size_type capacity()
-	{
+	size_type capacity()const{
 		return num_pages() * page_size;
 	}
 	void reserve(size_type size) {
@@ -167,52 +177,86 @@ public:
 			resize_pages(page_divide_ceil(size));
 		}
 	}
+	//erase all elements, but dont deallocate anything
 	void clear() {
-		if (page_array) {
-			for (auto i = 0; i < this->page_capacity; i++) {
-				destroy_page(i);
-			}
-		}
-		last_index = 0;
-		page_capacity = 0;
-		page_array = nullptr;
+
+		delete_range(0, last_index);
+		last_index = 0;		
 	}
 	void resize(size_type size) {
-		resize(size,value_type{});
+		auto old_size = last_index;
+
+		resize_uninitialized(size);
+
+		while (old_size < size) {
+			init_at(old_size++);
+		}
 	}
 
 	void resize(size_type size, const value_type& value) {
 
 		auto old_size = last_index;
 
-		auto new_pages = page_divide_ceil(size);
-
-		if (size < last_index) {
-			delete_range(size, last_index);
+		resize_uninitialized(size);
+		//default-initialize the elements properly if they arent trivial
+		if (!std::is_trivially_destructible<T>::value) {
+			int start = old_size;
+			while (start < size) {
+				init_at(start++);
+			}
 		}
-
-		resize_pages(new_pages);
 		
-		if (size > old_size) {
-			init_range(old_size, size, value);
+		while (old_size < size) {			
+			operator[](old_size++) = value;
 		}
-
-		last_index = size;
 	}
+
 	template<typename V>
 	void push_back(const V& value) {
+		
+		resize(last_index + 1,value);
+	}
+	template<typename V>
+	void push_back(V&& value) {
+
+		resize_uninitialized(last_index + 1);
+		back() = value;
+	}
+	template<typename ...Args> void emplace_back(Args&&... args)
+	{
 		const auto idx = last_index;
-		resize(last_index + 1);
-		operator[](idx) = value;
+		resize_uninitialized(last_index + 1);
+
+		init_at(idx, std::forward<Args>(args)...);
 	}
 	void pop_back() {
 		resize(last_index - 1);
 	}
 
-	T& back() {
+	reference back() {
 		return operator[](last_index - 1);
 	}
 private:
+
+	void resize_uninitialized(size_type size) {
+
+		
+		if (size < last_index) {
+			delete_range(last_index,size);
+		}
+		//if resizing to 0, this is a full clear
+		if (size == 0) {
+			resize_pages(0);
+			delete[] page_array;
+			page_capacity = 0;
+			page_array = nullptr;
+		}
+		else {
+			resize_pages(page_divide_ceil(size));
+		}		
+
+		last_index = size;
+	}
 
 	static size_t page_divide_ceil(size_t idx) {
 		return (idx + page_size - 1) / page_size;
@@ -221,24 +265,35 @@ private:
 	size_type num_pages() const{
 		return last_index >> bits;
 	}
-	void destroy_page(size_t index) {
+	
+	void delete_range(size_t start, size_t end) {
+		//destroy all elements, only if they arent trivial
+		if (!std::is_trivially_destructible<T>::value) {
+			while (start < end) {
+				at_index(start++)->~T();
+			}
+		}		
+	}
 
+	pointer at_index(size_t index) const {
+		const auto page_idx = index >> bits;
+		const auto element_idx = index & mask;
+		pointer tp = reinterpret_cast<pointer>(page_array[page_idx]);
+		return tp + element_idx;
+	}
+	template<typename ...Args>
+	void init_at(size_t index, Args&&... args) {
+		new(at_index(index)) T(std::forward<Args>(args)...);
+	}
+
+	void create_page(size_t index) {
+		//page_array[index] = malloc(sizeof(T) * page_size);
+		page_array[index] = new page();
+	}
+	void destroy_page(size_t index) {
+		//free(page_array[index]);
 		delete page_array[index];
 		page_array[index] = nullptr;
-	}
-	void delete_range(size_t start, size_t end) {
-		//destroy all elements
-		for (auto i = start; i < end; i++) {
-			(*this)[i].~T();
-		}
-	}
-	void init_range(size_t start, size_t end, const value_type& value) {
-		for (auto i = start; i < end; i++) {
-			(*this)[i] = value;
-		}
-	}
-	void create_page(size_t index) {
-		page_array[index] = new page;
 	}
 	void resize_pages(size_type new_pages) {
 		//no realloc needed
@@ -251,13 +306,18 @@ private:
 			}
 		}
 		else if (new_pages > page_capacity) {
-			page** new_array = new page * [new_pages];
-			for (auto i = 0; i < page_capacity; i++) {
-				new_array[i] = page_array[i];
+			page** new_array = new page*[new_pages];
+			
+			if (page_array)
+			{
+				for (size_t i = 0; i < page_capacity; i++) {
+					new_array[i] = page_array[i];
+				}
+				delete[] page_array;
 			}
-			delete[] page_array;
+			
 			page_array = new_array;
-			for (auto i = page_capacity; i < new_pages; i++) {
+			for (size_t i = page_capacity; i < new_pages; i++) {
 				create_page(i);
 			}
 			page_capacity = new_pages;
@@ -266,7 +326,7 @@ private:
 
 
 	size_type last_index{ 0 };
-	page** page_array{ nullptr };
+	page** page_array{nullptr};
 
 	//size of page array
 	size_type page_capacity{ 0 };
